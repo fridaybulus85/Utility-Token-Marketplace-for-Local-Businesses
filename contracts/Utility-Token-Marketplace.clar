@@ -10,6 +10,9 @@
 (define-constant err-insufficient-tokens (err u108))
 (define-constant err-invalid-price (err u109))
 (define-constant err-order-not-found (err u110))
+(define-constant err-stake-not-found (err u111))
+(define-constant err-stake-still-locked (err u112))
+(define-constant err-invalid-duration (err u113))
 
 (define-map businesses
   { business-id: uint }
@@ -342,4 +345,99 @@
 
 (define-read-only (get-next-order-id)
   (var-get next-order-id)
+)
+
+
+(define-map token-stakes
+  { stake-id: uint }
+  {
+    staker: principal,
+    token-id: uint,
+    amount: uint,
+    stake-duration: uint,
+    start-block: uint,
+    end-block: uint,
+    active: bool
+  }
+)
+
+(define-data-var next-stake-id uint u1)
+
+(define-public (stake-tokens (token-id uint) (amount uint) (duration-blocks uint))
+  (let
+    (
+      (stake-id (var-get next-stake-id))
+      (current-block stacks-block-height)
+      (end-block (+ current-block duration-blocks))
+      (user-balance (get-token-balance token-id tx-sender))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= duration-blocks u144) err-invalid-duration)
+    (asserts! (>= user-balance amount) err-insufficient-tokens)
+    (map-set token-balances
+      { token-id: token-id, owner: tx-sender }
+      { balance: (- user-balance amount) }
+    )
+    (map-set token-stakes
+      { stake-id: stake-id }
+      {
+        staker: tx-sender,
+        token-id: token-id,
+        amount: amount,
+        stake-duration: duration-blocks,
+        start-block: current-block,
+        end-block: end-block,
+        active: true
+      }
+    )
+    (var-set next-stake-id (+ stake-id u1))
+    (ok stake-id)
+  )
+)
+
+(define-public (unstake-tokens (stake-id uint))
+  (let
+    (
+      (stake (unwrap! (map-get? token-stakes { stake-id: stake-id }) err-stake-not-found))
+      (current-block stacks-block-height)
+      (staker (get staker stake))
+      (token-id (get token-id stake))
+      (amount (get amount stake))
+      (duration (get stake-duration stake))
+      (reward-multiplier (if (>= duration u1008) u120 (if (>= duration u720) u110 u105)))
+      (reward-amount (/ (* amount (- reward-multiplier u100)) u100))
+      (total-return (+ amount reward-amount))
+      (current-balance (get-token-balance token-id staker))
+    )
+    (asserts! (is-eq tx-sender staker) err-unauthorized)
+    (asserts! (get active stake) err-stake-not-found)
+    (asserts! (>= current-block (get end-block stake)) err-stake-still-locked)
+    (map-set token-balances
+      { token-id: token-id, owner: staker }
+      { balance: (+ current-balance total-return) }
+    )
+    (map-set token-stakes
+      { stake-id: stake-id }
+      (merge stake { active: false })
+    )
+    (ok total-return)
+  )
+)
+
+(define-read-only (get-stake (stake-id uint))
+  (map-get? token-stakes { stake-id: stake-id })
+)
+
+(define-read-only (calculate-stake-reward (stake-id uint))
+  (match (map-get? token-stakes { stake-id: stake-id })
+    stake (let
+      (
+        (duration (get stake-duration stake))
+        (amount (get amount stake))
+        (multiplier (if (>= duration u1008) u120 (if (>= duration u720) u110 u105)))
+      )
+      (ok (/ (* amount (- multiplier u100)) u100))
+    )
+    err-stake-not-found
+  )
 )
