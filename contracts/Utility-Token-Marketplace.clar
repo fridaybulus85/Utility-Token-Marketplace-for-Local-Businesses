@@ -14,6 +14,12 @@
 (define-constant err-stake-still-locked (err u112))
 (define-constant err-invalid-duration (err u113))
 
+(define-constant reward-tier-1-threshold u5)
+(define-constant reward-tier-2-threshold u15)
+(define-constant reward-tier-3-threshold u30)
+(define-constant loyalty-bonus-blocks u144)
+(define-constant err-no-rewards (err u200))
+
 (define-map businesses
   { business-id: uint }
   {
@@ -440,4 +446,91 @@
     )
     err-stake-not-found
   )
+)
+
+(define-map user-rewards
+  { user: principal, token-id: uint }
+  {
+    total-purchased: uint,
+    purchase-count: uint,
+    last-purchase-block: uint,
+    accumulated-bonus: uint,
+    tier-level: uint
+  }
+)
+
+(define-private (calculate-reward-tier (purchase-count uint) (total-purchased uint))
+  (if (>= purchase-count reward-tier-3-threshold)
+    u3
+    (if (>= purchase-count reward-tier-2-threshold)
+      u2
+      (if (>= purchase-count reward-tier-1-threshold)
+        u1
+        u0
+      )
+    )
+  )
+)
+
+(define-private (calculate-bonus-tokens (amount uint) (tier uint) (is-loyal bool))
+  (let
+    (
+      (base-bonus (/ (* amount tier) u100))
+      (loyalty-multiplier (if is-loyal u2 u1))
+    )
+    (* base-bonus loyalty-multiplier)
+  )
+)
+
+(define-private (update-user-rewards (user principal) (token-id uint) (amount uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (existing-rewards (default-to 
+        { total-purchased: u0, purchase-count: u0, last-purchase-block: u0, accumulated-bonus: u0, tier-level: u0 }
+        (map-get? user-rewards { user: user, token-id: token-id })
+      ))
+      (new-total (+ (get total-purchased existing-rewards) amount))
+      (new-count (+ (get purchase-count existing-rewards) u1))
+      (is-loyal (>= current-block (+ (get last-purchase-block existing-rewards) loyalty-bonus-blocks)))
+      (new-tier (calculate-reward-tier new-count new-total))
+      (bonus-tokens (calculate-bonus-tokens amount new-tier is-loyal))
+      (new-bonus (+ (get accumulated-bonus existing-rewards) bonus-tokens))
+    )
+    (map-set user-rewards
+      { user: user, token-id: token-id }
+      {
+        total-purchased: new-total,
+        purchase-count: new-count,
+        last-purchase-block: current-block,
+        accumulated-bonus: new-bonus,
+        tier-level: new-tier
+      }
+    )
+    bonus-tokens
+  )
+)
+
+(define-public (claim-reward-tokens (token-id uint))
+  (let
+    (
+      (rewards (unwrap! (map-get? user-rewards { user: tx-sender, token-id: token-id }) err-no-rewards))
+      (bonus-amount (get accumulated-bonus rewards))
+      (current-balance (get-token-balance token-id tx-sender))
+    )
+    (asserts! (> bonus-amount u0) err-no-rewards)
+    (map-set token-balances
+      { token-id: token-id, owner: tx-sender }
+      { balance: (+ current-balance bonus-amount) }
+    )
+    (map-set user-rewards
+      { user: tx-sender, token-id: token-id }
+      (merge rewards { accumulated-bonus: u0 })
+    )
+    (ok bonus-amount)
+  )
+)
+
+(define-read-only (get-user-rewards (user principal) (token-id uint))
+  (map-get? user-rewards { user: user, token-id: token-id })
 )
