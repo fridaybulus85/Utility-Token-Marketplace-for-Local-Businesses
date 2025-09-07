@@ -20,6 +20,11 @@
 (define-constant loyalty-bonus-blocks u144)
 (define-constant err-no-rewards (err u200))
 
+(define-constant err-flash-loan-not-repaid (err u300))
+(define-constant err-flash-loan-insufficient-fee (err u301))
+(define-constant err-flash-loan-active (err u302))
+(define-constant err-flash-loan-invalid-callback (err u303))
+
 (define-map businesses
   { business-id: uint }
   {
@@ -533,4 +538,124 @@
 
 (define-read-only (get-user-rewards (user principal) (token-id uint))
   (map-get? user-rewards { user: user, token-id: token-id })
+)
+
+
+
+
+(define-map flash-loans
+  { loan-id: uint }
+  {
+    borrower: principal,
+    token-id: uint,
+    amount: uint,
+    fee: uint,
+    active: bool,
+    created-block: uint
+  }
+)
+
+(define-data-var next-loan-id uint u1)
+(define-data-var flash-loan-fee-rate uint u50)
+
+(define-public (execute-flash-loan (token-id uint) (amount uint) (callback-contract principal))
+  (let
+    (
+      (loan-id (var-get next-loan-id))
+      (current-block stacks-block-height)
+      (fee (/ (* amount (var-get flash-loan-fee-rate)) u10000))
+      (token (unwrap! (map-get? utility-tokens { token-id: token-id }) err-token-not-found))
+      (business (unwrap! (map-get? businesses { business-id: (get business-id token) }) err-business-not-found))
+      (business-owner (get owner business))
+      (available-balance (get-token-balance token-id business-owner))
+    )
+    (asserts! (get active token) err-token-not-found)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= available-balance amount) err-insufficient-tokens)
+    
+    (map-set flash-loans
+      { loan-id: loan-id }
+      {
+        borrower: tx-sender,
+        token-id: token-id,
+        amount: amount,
+        fee: fee,
+        active: true,
+        created-block: current-block
+      }
+    )
+    (var-set next-loan-id (+ loan-id u1))
+    
+    (map-set token-balances
+      { token-id: token-id, owner: business-owner }
+      { balance: (- available-balance amount) }
+    )
+    (map-set token-balances
+      { token-id: token-id, owner: tx-sender }
+      { balance: (+ (get-token-balance token-id tx-sender) amount) }
+    )
+    
+    (try! (validate-flash-loan-repayment loan-id))
+    (ok loan-id)
+  )
+)
+
+(define-private (validate-flash-loan-repayment (loan-id uint))
+  (let
+    (
+      (loan (unwrap! (map-get? flash-loans { loan-id: loan-id }) err-flash-loan-not-repaid))
+      (borrower (get borrower loan))
+      (token-id (get token-id loan))
+      (amount (get amount loan))
+      (fee (get fee loan))
+      (required-balance (+ amount fee))
+      (borrower-balance (get-token-balance token-id borrower))
+      (token (unwrap! (map-get? utility-tokens { token-id: token-id }) err-token-not-found))
+      (business (unwrap! (map-get? businesses { business-id: (get business-id token) }) err-business-not-found))
+      (business-owner (get owner business))
+      (business-balance (get-token-balance token-id business-owner))
+    )
+    (asserts! (get active loan) err-flash-loan-not-repaid)
+    (asserts! (>= borrower-balance required-balance) err-flash-loan-not-repaid)
+    
+    (map-set token-balances
+      { token-id: token-id, owner: borrower }
+      { balance: (- borrower-balance required-balance) }
+    )
+    (map-set token-balances
+      { token-id: token-id, owner: business-owner }
+      { balance: (+ business-balance amount) }
+    )
+    (map-set token-balances
+      { token-id: token-id, owner: contract-owner }
+      { balance: (+ (get-token-balance token-id contract-owner) fee) }
+    )
+    
+    (map-set flash-loans
+      { loan-id: loan-id }
+      (merge loan { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-flash-loan-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u1000) err-invalid-amount)
+    (var-set flash-loan-fee-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-read-only (get-flash-loan (loan-id uint))
+  (map-get? flash-loans { loan-id: loan-id })
+)
+
+(define-read-only (calculate-flash-loan-fee (amount uint))
+  (/ (* amount (var-get flash-loan-fee-rate)) u10000)
+)
+
+(define-read-only (get-flash-loan-fee-rate)
+  (var-get flash-loan-fee-rate)
 )
