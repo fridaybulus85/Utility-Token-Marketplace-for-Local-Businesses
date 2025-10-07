@@ -25,6 +25,11 @@
 (define-constant err-flash-loan-active (err u302))
 (define-constant err-flash-loan-invalid-callback (err u303))
 
+(define-constant err-buyback-not-found (err u400))
+(define-constant err-buyback-inactive (err u401))
+(define-constant err-insufficient-buyback-balance (err u402))
+(define-constant err-below-minimum-buyback (err u403))
+
 (define-map businesses
   { business-id: uint }
   {
@@ -658,4 +663,107 @@
 
 (define-read-only (get-flash-loan-fee-rate)
   (var-get flash-loan-fee-rate)
+)
+
+(define-map buyback-programs
+  { program-id: uint }
+  {
+    business-id: uint,
+    token-id: uint,
+    buyback-price: uint,
+    max-buyback-amount: uint,
+    current-bought-back: uint,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var next-buyback-id uint u1)
+
+(define-public (create-buyback-program (token-id uint) (buyback-price uint) (max-buyback-amount uint))
+  (let
+    (
+      (program-id (var-get next-buyback-id))
+      (token (unwrap! (map-get? utility-tokens { token-id: token-id }) err-token-not-found))
+      (business (unwrap! (map-get? businesses { business-id: (get business-id token) }) err-business-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get owner business)) err-unauthorized)
+    (asserts! (get active token) err-token-not-found)
+    (asserts! (> buyback-price u0) err-invalid-price)
+    (asserts! (> max-buyback-amount u0) err-invalid-amount)
+    (map-set buyback-programs
+      { program-id: program-id }
+      {
+        business-id: (get business-id token),
+        token-id: token-id,
+        buyback-price: buyback-price,
+        max-buyback-amount: max-buyback-amount,
+        current-bought-back: u0,
+        active: true,
+        created-at: current-block
+      }
+    )
+    (var-set next-buyback-id (+ program-id u1))
+    (ok program-id)
+  )
+)
+
+(define-public (execute-buyback (program-id uint) (amount uint))
+  (let
+    (
+      (program (unwrap! (map-get? buyback-programs { program-id: program-id }) err-buyback-not-found))
+      (token-id (get token-id program))
+      (buyback-price (get buyback-price program))
+      (remaining-capacity (- (get max-buyback-amount program) (get current-bought-back program)))
+      (token (unwrap! (map-get? utility-tokens { token-id: token-id }) err-token-not-found))
+      (business (unwrap! (map-get? businesses { business-id: (get business-id program) }) err-business-not-found))
+      (business-owner (get owner business))
+      (user-balance (get-token-balance token-id tx-sender))
+      (business-balance (get-token-balance token-id business-owner))
+      (total-payout (* amount buyback-price))
+    )
+    (asserts! (get active program) err-buyback-inactive)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (<= amount remaining-capacity) err-insufficient-buyback-balance)
+    (asserts! (>= user-balance amount) err-insufficient-tokens)
+    (try! (stx-transfer? total-payout business-owner tx-sender))
+    (map-set token-balances
+      { token-id: token-id, owner: tx-sender }
+      { balance: (- user-balance amount) }
+    )
+    (map-set token-balances
+      { token-id: token-id, owner: business-owner }
+      { balance: (+ business-balance amount) }
+    )
+    (map-set buyback-programs
+      { program-id: program-id }
+      (merge program { current-bought-back: (+ (get current-bought-back program) amount) })
+    )
+    (ok total-payout)
+  )
+)
+
+(define-public (deactivate-buyback-program (program-id uint))
+  (let
+    (
+      (program (unwrap! (map-get? buyback-programs { program-id: program-id }) err-buyback-not-found))
+      (token (unwrap! (map-get? utility-tokens { token-id: (get token-id program) }) err-token-not-found))
+      (business (unwrap! (map-get? businesses { business-id: (get business-id program) }) err-business-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner business)) err-unauthorized)
+    (map-set buyback-programs
+      { program-id: program-id }
+      (merge program { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-buyback-program (program-id uint))
+  (map-get? buyback-programs { program-id: program-id })
+)
+
+(define-read-only (get-next-buyback-id)
+  (var-get next-buyback-id)
 )
