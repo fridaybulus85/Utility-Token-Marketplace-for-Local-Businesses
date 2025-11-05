@@ -30,6 +30,11 @@
 (define-constant err-insufficient-buyback-balance (err u402))
 (define-constant err-below-minimum-buyback (err u403))
 
+(define-constant err-escrow-not-found (err u500))
+(define-constant err-escrow-already-settled (err u501))
+(define-constant err-escrow-not-expired (err u502))
+(define-constant err-invalid-party (err u503))
+
 (define-map businesses
   { business-id: uint }
   {
@@ -766,4 +771,120 @@
 
 (define-read-only (get-next-buyback-id)
   (var-get next-buyback-id)
+)
+
+(define-map escrow-agreements
+  { escrow-id: uint }
+  {
+    buyer: principal,
+    seller: principal,
+    token-id: uint,
+    token-amount: uint,
+    stx-amount: uint,
+    expiry-block: uint,
+    settled: bool,
+    created-at: uint
+  }
+)
+
+(define-data-var next-escrow-id uint u1)
+
+(define-public (create-escrow (seller principal) (token-id uint) (token-amount uint) (stx-amount uint) (duration-blocks uint))
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block duration-blocks))
+      (buyer-token-balance (get-token-balance token-id tx-sender))
+    )
+    (asserts! (> token-amount u0) err-invalid-amount)
+    (asserts! (> stx-amount u0) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-duration)
+    (asserts! (>= buyer-token-balance token-amount) err-insufficient-tokens)
+    (try! (stx-transfer? stx-amount tx-sender (as-contract tx-sender)))
+    (map-set token-balances
+      { token-id: token-id, owner: tx-sender }
+      { balance: (- buyer-token-balance token-amount) }
+    )
+    (map-set escrow-agreements
+      { escrow-id: escrow-id }
+      {
+        buyer: tx-sender,
+        seller: seller,
+        token-id: token-id,
+        token-amount: token-amount,
+        stx-amount: stx-amount,
+        expiry-block: expiry-block,
+        settled: false,
+        created-at: current-block
+      }
+    )
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (release-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id }) err-escrow-not-found))
+      (buyer (get buyer escrow))
+      (seller (get seller escrow))
+      (token-id (get token-id escrow))
+      (token-amount (get token-amount escrow))
+      (stx-amount (get stx-amount escrow))
+      (seller-balance (get-token-balance token-id seller))
+    )
+    (asserts! (is-eq tx-sender buyer) err-invalid-party)
+    (asserts! (not (get settled escrow)) err-escrow-already-settled)
+    (try! (as-contract (stx-transfer? stx-amount tx-sender seller)))
+    (map-set token-balances
+      { token-id: token-id, owner: seller }
+      { balance: (- seller-balance token-amount) }
+    )
+    (map-set token-balances
+      { token-id: token-id, owner: buyer }
+      { balance: (+ (get-token-balance token-id buyer) token-amount) }
+    )
+    (map-set escrow-agreements
+      { escrow-id: escrow-id }
+      (merge escrow { settled: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id }) err-escrow-not-found))
+      (current-block stacks-block-height)
+      (buyer (get buyer escrow))
+      (token-id (get token-id escrow))
+      (token-amount (get token-amount escrow))
+      (stx-amount (get stx-amount escrow))
+      (buyer-balance (get-token-balance token-id buyer))
+    )
+    (asserts! (or (is-eq tx-sender buyer) (is-eq tx-sender (get seller escrow))) err-invalid-party)
+    (asserts! (not (get settled escrow)) err-escrow-already-settled)
+    (asserts! (>= current-block (get expiry-block escrow)) err-escrow-not-expired)
+    (try! (as-contract (stx-transfer? stx-amount tx-sender buyer)))
+    (map-set token-balances
+      { token-id: token-id, owner: buyer }
+      { balance: (+ buyer-balance token-amount) }
+    )
+    (map-set escrow-agreements
+      { escrow-id: escrow-id }
+      (merge escrow { settled: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrow-agreements { escrow-id: escrow-id })
+)
+
+(define-read-only (get-next-escrow-id)
+  (var-get next-escrow-id)
 )
